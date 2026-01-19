@@ -1,0 +1,10 @@
+all:
+  children:
+    kube_control_plane:
+      hosts:
+        cp1:
+          ansible_host: 192.168.0.200
+        cp2:
+          ansible_host: 192.168.4.106
+        cp3:
+          ansible_host: 192.168.4.107

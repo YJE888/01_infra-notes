@@ -1,0 +1,90 @@
+- name: kubeadm certs renew
+  hosts: kube_control_plane
+  serial: 1
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Pre-Check certs check-expiration
+      shell: |
+        /usr/local/bin/kubeadm certs check-expiration | awk '$1=="apiserver" {gsub("d","",$7); print $7}'
+      register: apiserver_days_cmd
+      changed_when: false
+
+    - name: Set min_days
+      set_fact:
+        min_days: "{{ apiserver_days_cmd.stdout | trim | int }}"
+      changed_when: false
+
+    - name: Set renew flag
+      set_fact:
+        renew: "{{ (min_days | int) < 30 }}"
+      changed_when: false
+
+    - name: Show min_days and renew decision
+      debug:
+        msg:
+          - "min_days={{ min_days }}"
+          - "renew={{ renew }}"
+
+    - name: backup_date(YYYYMMDD)
+      set_fact:
+        backup_date: "{{ lookup('pipe', 'date +%Y%m%d') }}"
+      run_once: true
+
+    - name: backup directory create
+      file:
+        path: "/root/k8s-certs-backup/{{ backup_date }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: renew | bool
+
+    - name: Backup /etc/kubernetes
+      archive:
+        path: /etc/kubernetes
+        dest: "/root/k8s-certs-backup/{{ backup_date }}/kubernetes.tar.gz"
+        format: gz
+      when: renew | bool
+
+    - name: Renew k8s certs when renew=true
+      command: /usr/local/bin/kubeadm certs renew all
+      when: renew | bool
+
+    - name: Update kubeconfig
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/root/.kube/config"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+      when: renew | bool
+
+    - name: Restart kubelet to reload static pods
+      systemd:
+        name: kubelet
+        state: restarted
+      when: renew | bool
+
+    - name: Post-Check certs check-expiration
+      command: /usr/local/bin/kubeadm certs check-expiration
+      register: cert_check
+      changed_when: false
+      when: renew | bool
+
+    - name: Post-Check kubectl get nodes
+      command: /usr/local/bin/kubectl get nodes -o wide
+      register: nodes_out
+      changed_when: false
+      when: renew | bool
+
+    - name: Show post-check summary
+      debug:
+        msg:
+          - "===== CERTIFICATE EXPIRATION ====="
+          - "{{ cert_check.stdout_lines }}"
+          - ""
+          - "===== NODE STATUS ====="
+          - "{{ nodes_out.stdout_lines }}"
+      when: renew | bool

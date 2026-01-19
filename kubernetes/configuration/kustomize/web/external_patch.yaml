@@ -1,0 +1,6 @@
+- op: replace
+  path: /spec/replicas
+  value: 3
+- op: add
+  path: /metadata/labels/cat
+  value: animal
