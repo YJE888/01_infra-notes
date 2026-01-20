@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     tzdata \
+    vim \
   && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
   && echo $TZ > /etc/timezone \
   && rm -rf /var/lib/apt/lists/*
@@ -22,7 +23,7 @@ RUN pip install --no-cache-dir \
     ansible-core==2.17.* \
     passlib
 
-RUN ansible-galaxy collection install community.general
+RUN ansible-galaxy collection install community.general:==12.2.0
 
 RUN curl -fsSLO "$SUPERCRONIC_URL" \
     && echo "${SUPERCRONIC_SHA1SUM}  ${SUPERCRONIC}" | sha1sum -c - \
@@ -34,6 +35,7 @@ WORKDIR /work
 
 COPY crontab /etc/crontab
 COPY entrypoint.sh /entrypoint.sh
+COPY ansible.cfg /work
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

@@ -1,4 +1,6 @@
-# ansible-cron (Ansible + Supercronic) 운영 가이드
+# 인증서 자동 갱신(컨테이너 환경)
+
+- 사용한 툴 : Ansible + Supercronic
 
 ## 목표
 
@@ -134,3 +136,85 @@
   ```bash
   docker rm -f ansible-cron
   ```
+
+## Crontab 환경에서의 문제
+
+- shell 환경에서는 문제없이 실행됐지만 crontab에 정의된 대로 Supercronic으로 cron 환경에서 실행 시 아래와 같은 에러 발생
+  ```bash
+  ERROR! [DEPRECATED]: community.general.yaml has been removed. The plugin has been superseded by the option `result_format=yaml` in callback plugin ansible.builtin.default from ansible-core 2.13 onwards. This feature was removed from community.general in version 12.0.0. Please update your playbooks.
+  ```
+
+### 해결 방법
+
+- ansible.cfg 환경 정의 및 cron 실행 환경에 환경변수로 추가
+- ansible 기본 설정 파일 정의 후 컨테이너 내부의 /work 경로에 위치되게끔 이미지 수정
+  ```bash
+  vi ansible.cfg
+  ```
+  ```bash
+  [defaults]
+  stdout_callback = ansible.builtin.default
+  result_format = yaml
+  ```
+- crontab 파일에 환경변수 추가
+
+  ```bash
+  SHELL=/bin/sh
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+  # ansible 환경 변수 추가
+  ANSIBLE_CONFIG=/work/ansible.cfg
+
+  10 3 20 * * cd /work && /usr/local/bin/ansible-playbook -i inventory/hosts.yaml playbooks/renew-k8s-certs.yaml >> /work/logs/ansible-$(date +\%Y-\%m).log 2>&1 ; find /work/logs -name "ansible-*.log" -type f -mtime +365 -delete
+  ```
+
+## NAS 환경에서의 실행
+
+- NAS에 이미지 업로드
+  - 서버에서 이미지 압축 후 NAS의 `Container Manager > 이미지 > 작업 > 가져오기 > 파일에서 추가 > 로컬 장치에서` 로 이미지 업로드
+
+  ```bash
+  # 이미지 압축
+  docker save k8s-cert-renew:0.1 -o k8s-cert-renew_0.1.tar
+  ```
+
+- NAS의 File Station에서 프로젝트 볼륨(예: `/volume1/docker/k8s-cert-renew`)에 `inventory/`, `playbooks/`, `ssh/` 디렉토리 생성 및 파일 위치
+
+  ```bash
+  $ pwd
+  /volume1/docker/k8s-cert-renew
+  $ ls
+  inventory playbooks ssh
+
+  $ ls inventory
+  hosts.yaml
+
+  $ ls playbooks
+  renew-kubeadm-certs-container.yaml
+
+  $ ls ssh
+  id_ed25519.pub
+  known_hosts
+  ```
+
+- NAS의 File Station의 프로젝트 볼륨에 `compose.yaml` 파일 업로드
+
+  ```yaml
+  version: "3.8"
+
+  services:
+    k8s-cert-renew:
+      image: k8s-cert-renew:0.1
+      container_name: ansible-cron
+      restart: unless-stopped
+
+      volumes:
+        - /volume1/docker/k8s-cert-renew/playbooks:/work/playbooks:ro
+        - /volume1/docker/k8s-cert-renew/inventory:/work/inventory:ro
+        - /volume1/docker/k8s-cert-renew/ssh:/work/ssh:ro
+  ```
+
+- NAS의 Container Manager에서 프로젝트 생성 > File Station에서 생성한 경로 선택 > 생성
+  - 컨테이너 탭에서 생성한 컨테이너 클릭 > 작업 > 터미널 열기 > 생성(bash) 클릭 시 터미널 접속 가능
+  - 컨테이너에서 control plane 호스트로의 ping 통신 확인
+    ![alt text](images/image.png)

@@ -1,5 +1,6 @@
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+## ansible 기본 환경설정 내용 추가
+ANSIBLE_CONFIG=/work/ansible.cfg 
 
-# 10 3 1 * * cd /work && ansible-playbook -i inventory/hosts.yaml playbooks/renew-k8s-certs.yml >> /work/logs/ansible.log 2>&1
-10 3 20 * * cd /work && ansible-playbook -i inventory/hosts.yaml playbooks/renew-k8s-certs.yaml >> /work/logs/ansible-$(date +\%Y-\%m).log 2>&1 ; find /work/logs -name "ansible-*.log" -type f -mtime +365 -delete
+10 3 1 * * cd /work && ansible-playbook -i inventory/hosts.yaml playbooks/renew-k8s-certs.yaml >> /work/logs/ansible-$(date +\%Y-\%m).log 2>&1 ; find /work/logs -name "ansible-*.log" -type f -mtime +365 -delete
