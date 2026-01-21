@@ -218,3 +218,18 @@
   - 컨테이너 탭에서 생성한 컨테이너 클릭 > 작업 > 터미널 열기 > 생성(bash) 클릭 시 터미널 접속 가능
   - 컨테이너에서 control plane 호스트로의 ping 통신 확인
     ![alt text](images/image.png)
+
+### 컨테이너 내부에서 사용되는 Master 서버 추가 방법
+
+- inventory/hosts.yaml 파일에서 cp(control plane) 서버 추가
+- ssh 공개키 배포 및 known_hosts 등록
+- 마운트된 볼륨에 known_hosts 업로드(컨테이너 내부의 /work 경로)
+- 컨테이너 내부의 .ssh 경로에 known_hosts이 적용되게 복사 후 권한 설정 필요
+  ```bash
+  cp /work/ssh/known_hosts /root/.ssh/known_hosts
+  chmod 600 /root/.ssh/known_hosts
+  ```
+- ping 모듈로 통신 확인
+  ```bash
+  ansible -i inventory/hosts.yaml all -m ping
+  ```
