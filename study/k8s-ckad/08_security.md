@@ -60,7 +60,6 @@
           curl -v -k https://master-node-ip:6443/api/v1/pods \
           --header "Authorization: Bearer KpjcVbI7rCFAHYPkBzRb7gu1cUc4B"
           ```
-
   - Service Accounts
     - Bot
 
@@ -525,3 +524,409 @@
 - OLM(Operator Lifecycle Manager)
   - Operator의 설치 및 업그레이드 버전 관리 담당자
   - Operator 설치, 자동 업그레이드, 의존성 관리
+
+---
+
+## RBAC
+
+dev-user(kubeconfig에 명시되어 있는 user)가 default 네임스페이스에서 Pod를 생성(create), 조회(list), 삭제(delete)할 수 있도록 필요한 Role과 RoleBinding을 생성
+
+- Role 이름: developer
+- Role 리소스: pods
+- Role 권한(동작):
+  - list
+  - create
+  - delete
+- RoleBinding 이름: dev-user-binding
+- RoleBinding 대상 사용자: dev-user
+
+```bash
+# kubeconfig 파일 확인
+$ k config view | grep -w -A4 dev-user
+- name: dev-user
+  user:
+    client-certificate-data: DATA+OMITTED
+    client-key-data: DATA+OMITTED
+
+# dev-user로 파드 조회
+$ kubectl get pods --as dev-user
+Error from server (Forbidden): pods is forbidden: User "dev-user" cannot list resource "pods" in API group "" in the namespace "default"
+
+# Role 생성
+$ kubectl create role developer --verb list,create,delete --resource pods
+role.rbac.authorization.k8s.io/developer created
+
+# RoleBinding 생성
+$ k create rolebinding dev-user-binding --role developer --user dev-user
+rolebinding.rbac.authorization.k8s.io/dev-user-binding created
+
+# 권한 확인
+kubectl get pods --as dev-user
+NAME                  READY   STATUS    RESTARTS   AGE
+red-cdd5fc4dd-cmzzc   1/1     Running   0          10m
+red-cdd5fc4dd-g844v   1/1     Running   0          10m
+```
+
+## Security Context
+
+- Pod 또는 Container의 보안 설정을 정의하는 필드
+- 리눅스의 권한/보안 기능을 쿠버네티스에서 제어할 수 있게 해줌
+
+### 적용 레벨
+
+1. Pod 레벨 - `spec.securityContext`
+2. Container 레벨 - `spec.containers[].securityContext`
+
+- Container 레벨이 Pod 레벨보다 우선순위가 높음
+
+Pod 레벨 vs Container 레벨 비교
+
+| 옵션                     | Pod 레벨 | Container 레벨 |
+| ------------------------ | -------- | -------------- |
+| runAsUser                | O        | O              |
+| runAsGroup               | O        | O              |
+| runAsNonRoot             | O        | O              |
+| fsGroup                  | O        | X              |
+| capabilities             | X        | O              |
+| privileged               | X        | O              |
+| allowPrivilegeEscalation | X        | O              |
+| readOnlyRootFilesystem   | X        | O              |
+
+### 주요 옵션
+
+- `runAsUser / runAsGroup`
+  - 컨테이너 프로세스를 실행할 UID / GID 지정
+
+```yaml
+securityContext:
+  runAsUser: 1000 # UID 1000으로 실행
+  runAsGroup: 3000 # GID 3000으로 실행
+```
+
+- `runAsNonRoot`
+  - root(UID=0)로 실행 금지
+
+```yaml
+securityContext:
+  runAsNonRoot: true # root로 실행 시 컨테이너 시작 거부
+```
+
+- `fsGroup`
+  - 볼륨(Volume)에 대한 그룹 소유권 설정 **Pod 레벨에서만 사용** 가능
+
+```yaml
+securityContext:
+  fsGroup: 2000 # 마운트된 볼륨의 파일들이 GID 2000 소유가 됨
+```
+
+- `capabilities`
+  - 리눅스 capabilities 추가/제거 *container 레벨*에서만 사용 가능
+
+```yaml
+securityContext:
+  capabilities:
+    add: ["NET_ADMIN", "SYS_TIME"] # 권한 추가
+    drop: ["ALL"] # 모든 권한 제거
+```
+
+- `NET_ADMIN` : 네트워크 설정 변경 권한
+- `SYS_TIME` : 시스템 시간 변경 권한
+- `SYS_PTRACE` : 프로세스 추적 권한
+- `ALL` : 모든 권한
+
+- `privileged`
+  - 컨테이너를 특권 모드로 실행(호스트와 동일한 권한)
+
+```yaml
+securityContext:
+  privileged: true # ⚠️ 매우 위험, 운영환경 사용 지양
+```
+
+- `allowPrivilegeEscalation`
+  - 권한 상승 허용 여부(sudo, setuid등)
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false # 권한 상승 차단
+```
+
+- `readOnlyRootFilesystem`
+  - 루트 파일시스템을 읽기 전용으로 설정
+
+```yaml
+securityContext:
+  readOnlyRootFilesystem: true # 파일시스템 변경 불가
+```
+
+- `seccompProfile`
+  - 시스템 콜(syscall)제한 프로파일 설정
+
+```yaml
+securityContext:
+  seccompProfile:
+    type: RuntimeDefault # 런타임 기본 프로파일 사용
+```
+
+- `RuntimeDefault` : 컨테이너 런타임 기본값
+- `Unconfined` : 제한 없음
+- `Localhost` : 노드의 커스텀 프로파일 사용
+
+### 보안 Best Practice(모범 사례)
+
+- runAsNonRoot : 항상 true 로 설정
+- allowPrivilegeEscalation : false 설정
+- capabilities drop : ["ALL"] 후 필요한 것만 add
+- readOnlyRootFilesystem : true 설정
+- privileged : true 운영환경 사용 금지
+- runAsUser : 0 (root) 사용 금지
+
+### 사례
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-pod
+spec:
+  securityContext:
+    runAsUser: 1001
+  containers:
+    - image: ubuntu
+      name: web
+      command: ["sleep", "5000"]
+      securityContext:
+        runAsUser: 1002
+
+    - image: ubuntu
+      name: sidecar
+      command: ["sleep", "5000"]
+```
+
+- web 컨테이너는 uid가 1002로 실행됨
+- sidecar 컨테이너는 uid가 1001로 실행됨
+
+## Service Account
+
+- Service Account
+  - 파드 내부 애플리케이션이 쿠버네티스 API 서버와 통신할 때 사용하는 계정
+  ```bash
+  사람(Human)     → User Account     (kubectl 사용하는 사람)
+  애플리케이션    → Service Account  (파드 내부 앱이 API 서버에 접근할 때)
+  ```
+- 파드 생성 시 자동으로 token이 마운트됨
+- TokenRequest API 기반 토큰 사용
+- 만료 기간 있음 (보안 강화)
+- Projected Volume으로 마운트
+
+```bash
+# 경로: /var/run/secrets/kubernetes.io/serviceaccount/
+/var/run/secrets/kubernetes.io/serviceaccount/
+├── token      ← API 서버 인증 토큰
+├── ca.crt     ← 클러스터 CA 인증서
+└── namespace  ← 현재 네임스페이스
+```
+
+### 비활성화
+
+- service account 레벨에서 비활성화
+- pod/deployment 레벨에서 비활성화(pod 레벨 설정이 sa레벨보다 우선순위가 높음)
+
+### Projected Volume
+
+- 여러 개의 볼륨 소스를 하나의 디렉토리에 합쳐서 마운트하는 볼륨 타입
+- 일반 볼륨
+
+```yaml
+volumes:
+  - name: secret-vol
+    secret:
+      secretName: my-secret
+  - name: configmap-vol
+    configMap:
+      name: my-configmap
+```
+
+- Projected 볼륨
+
+```yaml
+volumes:
+  - name: token # 하나의 볼륨에
+    projected:
+      sources:
+        - serviceAccountToken: # SA 토큰
+            path: token
+        - secret: # Secret도 함께
+            name: my-secret
+        - configMap: # ConfigMap도 함께
+            name: my-configmap
+```
+
+### Projected Volume이 지원하는 소스 종류
+
+| 소스                  | 설명            |
+| --------------------- | --------------- |
+| `serviceAccountToken` | SA 토큰         |
+| `secret`              | 시크릿          |
+| `configMap`           | 컨피그맵        |
+| `downwardAPI`         | 파드 메타데이터 |
+
+---
+
+```
+Projected Volume = 쿠버네티스 공식 볼륨 타입 이름
+                   (여러 소스를 하나로 투영/합성한다는 의미)
+```
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-dashboard
+spec:
+  template:
+    spec:
+      serviceAccountName: dashboard-sa
+      automountServiceAccountToken: false # 자동 마운트 비활성화
+
+      volumes:
+        - name: token # 볼륨 이름
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607 # 토큰 만료 시간
+                  audience: api # 대상 서비스
+
+      containers:
+        - name: dashboard
+          image: nginx
+          volumeMounts:
+            - name: token # 볼륨 이름 매칭
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true # 읽기 전용
+```
+
+### 토큰 확인 방법
+
+```bash
+# 파드 내부에서 토큰 확인
+k exec -it my-pod -- cat /var/run/secrets/kubernetes.io/serviceaccount/token
+
+# SA에 연결된 Secret 확인 (구버전)
+k describe sa dashboard-sa
+
+# 토큰 직접 생성 (임시)
+k create token dashboard-sa
+
+# 만료 시간 지정해서 토큰 생성
+k create token dashboard-sa --duration=1h
+```
+
+### 요약
+
+- SA 생성 → k create sa <이름>
+- 파드에 SA 적용 → spec.serviceAccountName
+- 자동마운트 끄기 → automountServiceAccountToken: false
+- 권한 부여 → RoleBinding으로 SA에 Role 연결
+- 신버전 토큰 → Projected Volume 사용
+- 토큰 확인 → k create token <SA이름>
+
+## taint 와 toleration
+
+### Effect 효과
+
+- NoSchedule
+  - 새로운 파드 → Toleration 없으면 이 노드에 배치 안됨
+  - 기존 파드 → 그대로 유지 (영향 없음)
+- PreferNoSchedule
+  - 새로운 파드 → 가능하면 배치하지 않음, 다른 노드 없으면 배치됨 (완전 거부가 아닌 권고 수준)
+  - 기존 파드 → 그대로 유지
+- NoExecute
+  - 새로운 파드 → Toleration 없으면 배치 안됨
+  - 기존 파드 → Toleration 없으면 즉시 퇴출(Evict)!
+    tolerationSeconds 설정 시 해당 시간 후 퇴출
+
+| Effect             | 동작                                   | 기존 파드 |
+| ------------------ | -------------------------------------- | --------- |
+| `NoSchedule`       | Toleration 없는 파드 **스케줄링 거부** | 영향 없음 |
+| `PreferNoSchedule` | 가능하면 스케줄링 안 함 **(소프트)**   | 영향 없음 |
+| `NoExecute`        | 스케줄링 거부 + **기존 파드도 퇴출**   | 퇴출됨    |
+
+### toleration 옵션 상세
+
+```yaml
+tolerations:
+  - key: "app"
+    operator: "Equal"
+    value: "blue"
+    effect: "NoSchedule"
+    tolerationSeconds: 3600 # NoExecute일 때만 사용, 없으면 영원히 유지
+```
+
+- operator 종류
+- equal
+  - key=value 정확히 일치
+  - vaule 값 필요
+
+- exists
+  - key만 존재하면 됨
+  - value 불필요
+
+  ```yaml
+  # Equal 예시
+  tolerations:
+  - key: "app"
+    operator: "Equal"
+    value: "blue"
+    effect: "NoSchedule"
+
+  # Exists 예시 (value 없음)
+  tolerations:
+  - key: "app"
+    operator: "Exists"
+    effect: "NoSchedule"
+  ```
+
+## NodeAffinity
+
+```text
+NodeSelector  →  단순한 노드 선택 (key=value 정확히 일치)
+NodeAffinity  →  고급 노드 선택 (다양한 조건, 연산자 지원)
+```
+
+### NodeAffinity 타입
+
+- requiredDuringSchedulingIgnoredDuringExecution
+  - 반드시 만족해야됨(없으면 pending)
+  - 실행 중에 노드 변경 시 퇴출되지 않음
+- preferredDuringSchedulingIgnoredDuringExecution
+  - 만족하면 좋음
+  - 실행 중에 노드 변경 시 퇴출되지 않음
+
+### NodeAffinity Operator
+
+| operator     | 설명                          | value 필요 여부 |
+| ------------ | ----------------------------- | --------------- |
+| In           | 값 목록 중 하나와 일치        | O               |
+| NotIn        | 값 목록 중 어느 것과도 불일치 | O               |
+| Exists       | key만 존재하면 됨             | X               |
+| DoesNotExist | key가 존재하지 않아야 함      | X               |
+| Gt           | 지정한 값보다 커야 함         | O               |
+| Lt           | 지정한 값보다 작아야 함       | O               |
+
+### 예시
+
+In / NotIn
+노드 라벨: disktype=ssd, disktype=hdd, disktype=nvme
+
+- operator: In / values: [ssd, nvme] → ssd, nvme 노드만 선택
+- operator: NotIn / values: [hdd] → hdd 제외한 노드 선택
+  Exists / DoesNotExist
+- operator: Exists → disktype 라벨이 있는 노드면 값 상관없이 선택
+- operator: DoesNotExist → disktype 라벨이 아예 없는 노드만 선택
+
+Gt / Lt
+노드 라벨: cpu-count=4
+
+- operator: Gt / values: ["2"] → cpu-count가 2보다 큰 노드 선택 (4 선택됨)
+- operator: Lt / values: ["8"] → cpu-count가 8보다 작은 노드 선택 (4 선택됨)
