@@ -563,6 +563,7 @@ authorization:
 ```
 
 - Node Authorizer
+
   ```bash
   --authorization-mode=Node,RBAC
   ```
@@ -594,4 +595,211 @@ authorization:
   # 방법 2 - 자동 검증
   echo "$(cat kubelet.sha256) kubelet" | sha256sum --check
   # 출력: kubelet: OK  ← 일치하면 이렇게 나옴
+  ```
+
+## Ingress Security
+
+- Ingress 는 클러스터 외부에서 내부 서비스로 들어오는 HTTP/HTTPS 트래픽을 관리하는 API 오브젝트
+  ```bash
+  외부 사용자 → Ingress Controller (예: nginx) → Ingress 규칙 → Service → Pod
+  ```
+- Ingress 자체는 규칙(라우팅 정보)만 정의하고 실제 트래픽 처리는 Ingress Controller가 담당함(nginx-ingress, Traefik)
+
+### Ingress TLS 설정
+
+- Secret으로 TLS 인증서 준비
+  ```bash
+  kubectl create secret tls my-tls-secret \
+  --cert=tls.crt \
+  --key=tls.key \
+  -n default
+  ```
+- Ingress에 TLS 적용
+
+  ```yaml
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: secure-ingress
+    namespace: default
+  spec:
+    tls:
+      - hosts:
+          - myapp.example.com
+        secretName: my-tls-secret # ← 위에서 만든 Secret 참조
+    rules:
+      - host: myapp.example.com
+        http:
+          paths:
+            - path: /
+              pathType: Prefix
+              backend:
+                service:
+                  name: my-service
+                  port:
+                    number: 80
+  ```
+
+  - `tls` 섹션이 없으면 평문 HTTP로만 서비스되고, 있으면 해당 host에 대해 HTTPS가 강제됨
+
+- HTTP를 HTTPS로 강제 리다이렉트(nginx-ingress 예시)
+  ```yaml
+  metadata:
+    annotations:
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+  ```
+
+### 추가 보안 강화 설정
+
+- 클라이언트 인증서 요구(mTLS at Ingress Level)
+  - 외부 클라이언트도 인증서를 제시해야만 접근을 허용하는 설정
+  - 금융/내부 API등 민감한 서비스에서 사용
+  ```yaml
+  metadata:
+    annotations:
+      nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+      nginx.ingress.kubernetes.io/auth-tls-secret: "default/ca-secret"
+  ```
+- Rate Limiting(DoS 방어)
+
+  ```yaml
+  metadata:
+    annotations:
+      nginx.ingress.kubernetes.io/limit-rps: "10"
+  ```
+
+- 특정 IP만 허용(화이트리스트)
+  ```yaml
+  metadata:
+    annotations:
+      nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/24"
+  ```
+
+### 자주 다뤄지는 Ingress 보안 Annotations
+
+- SSL/TLS 관련
+  ```yaml
+  metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true" # HTTP→HTTPS 리다이렉트
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true" # TLS 미설정 상태에서도 강제
+    nginx.ingress.kubernetes.io/ssl-protocols: "TLSv1.2 TLSv1.3" # 허용 TLS 버전 제한
+    nginx.ingress.kubernetes.io/ssl-ciphers: "HIGH:!aNULL:!MD5" # 허용 암호화 스위트 제한
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS" # Ingress→백엔드 서비스 구간도 TLS
+  ```
+- 클라이언트 인증서(mTLS) 관련
+  ```yaml
+  metadata:
+    annotations:
+      nginx.ingress.kubernetes.io/ssl-redirect: "true" # HTTP→HTTPS 리다이렉트
+      nginx.ingress.kubernetes.io/force-ssl-redirect: "true" # TLS 미설정 상태에서도 강제
+      nginx.ingress.kubernetes.io/ssl-protocols: "TLSv1.2 TLSv1.3" # 허용 TLS 버전 제한
+      nginx.ingress.kubernetes.io/ssl-ciphers: "HIGH:!aNULL:!MD5" # 허용 암호화 스위트 제한
+      nginx.ingress.kubernetes.io/backend-protocol: "HTTPS" # Ingress→백엔드 서비스 구간도 TLS
+  ```
+- 접근 제어 관련
+  ```yaml
+  nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/24" # IP 화이트리스트
+  nginx.ingress.kubernetes.io/limit-rps: "10" # 초당 요청 제한 (DoS 방어)
+  nginx.ingress.kubernetes.io/limit-connections: "5" # 동시 연결 제한
+  ```
+- HTTP 보안 헤더 관련
+  ```yaml
+  nginx.ingress.kubernetes.io/configuration-snippet: |
+  more_set_headers "X-Frame-Options: DENY";
+  more_set_headers "X-Content-Type-Options: nosniff";
+  ```
+
+## NetworkPolicy
+
+- Pod간, Pod 외부 간 **네트워크 트래픽을 제어하는 방화벽 규칙**
+- 쿠버네티스 모든 파드는 기본적으로 서로 자유롭게 통신 가능한 `Flat Network` 모델이라 `NetworkPolicy` 없이는 클러스터 내부에서 제한 없이 접근 가능
+  - 보안상 매우 위험
+    > NetworkPolicy는 Kubernetes 오브젝트일 뿐, 실제로 수행하는 건 CNI 플러그인임!
+
+## 기본 동작 원리
+
+- NetworkPolicy가 하나도 없는 Pod는 모든 트래픽 허용
+- NetworkPolicy가 하나라도 해당되는 Pod를 선택하면 그 정책에 명시된 것만 허용되고 나머지는 거부됨
+- 기본 구조
+  ```yaml
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: example-policy
+    namespace: default
+  spec:
+    podSelector: # 어떤 Pod에 이 정책을 적용할지
+      matchLabels:
+        app: backend
+    policyTypes:
+      - Ingress # 이 정책이 제어하는 방향 (Ingress/Egress/둘다)
+      - Egress
+    ingress: # 허용할 인바운드 규칙
+      - from:
+          - podSelector:
+              matchLabels:
+                app: frontend
+        ports:
+          - protocol: TCP
+            port: 8080 # backend 파드의 서비스 포트(목적지 포트)
+    egress: # 허용할 아웃바운드 규칙
+      - to:
+          - podSelector:
+              matchLabels:
+                app: database
+        ports:
+          - protocol: TCP
+            port: 5432
+  ```
+- 특정 IP 대역만 허용
+  ```yaml
+  ingress:
+    - from:
+        - ipBlock: # 허용할 ip 블럭(차단의 의미가 아님)
+            cidr: 172.17.0.0/16
+            except:
+              - 172.17.1.0/24 # 이 대역은 제외
+  ```
+- DNS(kube-dns/CoreDNS)는 예외로 허용(Egress 정책 시 필수)
+  ```yaml
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+  ```
+  > - Egress를 제한하는 정책 생성 시 53번 포트 예외는 무조건 넣어줘야됨!
+  > - 이를 빼먹으면, pod가 다른 서비스 이름을 resolve 하지 못해서 애플리케이션 전체가 먹통이 됨
+
+### `from` / `to` 안에서의 AND vs OR 조건
+
+- OR 조건
+  ```yaml
+  # OR 조건 - 배열의 각 항목이 별도 - podSelector 매칭 OR namespaceSelector 매칭
+  ingress:
+    - from:
+        - podSelector:
+          matchLabels:
+          role: frontend
+        - namespaceSelector:
+          matchLabels:
+          team: frontend-team
+  ```
+- AND 조건
+  ```yaml
+  # AND 조건 - 하나의 배열 항목 안에 여러 selector - 둘 다 만족해야 함
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              role: frontend
+          namespaceSelector:
+            matchLabels:
+              team: frontend-team
   ```
