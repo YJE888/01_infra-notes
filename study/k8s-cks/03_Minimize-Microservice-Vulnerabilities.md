@@ -760,10 +760,10 @@ securityContext:
   ```
 - 표준 NetworkPolicy와 결정적 차이
 
-```text
-표준 K8s NetworkPolicy: Allow만 가능 (allow-list 모델)
-Cilium: Allow + explicit Deny 모두 가능
-```
+  ```text
+  표준 K8s NetworkPolicy: Allow만 가능 (allow-list 모델)
+  Cilium: Allow + explicit Deny 모두 가능
+  ```
 
 - Deny의 우선순위
   - Allow보다 항상 먼저 평가됨
@@ -818,3 +818,378 @@ Cilium: Allow + explicit Deny 모두 가능
           ▼
   Cilium (Pod들 간 네트워크 트래픽 세밀 제어 + 암호화)
   ```
+
+## Cilium Transparent Encryption - IPsec
+
+- Pod 간 트래픽을 커널 레벨의 IPsec 터널로 자동 암호화하는 방식
+
+### 동작 원리
+
+- Linux 커널에 내장된 IPsec 스택을 그대로 활용
+- 노드와 노드 사이에 암호화 터널을 만들어서, 그 터널을 통과하는 모든 Pod 트래픽이 자동으로 암호화됨
+- ESP(Encapsulating Security Payload) 프로토콜 사용
+
+### 설정 예시 (Helm)
+
+```bash
+helm upgrade cilium cilium/cilium \
+  --namespace kube-system \
+  --set encryption.enabled=true \
+  --set encryption.type=ipsec
+```
+
+### 특징
+
+- 오래되고 검증된 기술 (수십 년간 사용됨)
+- 다양한 네트워크 장비/방화벽과 호환성 좋음
+- 상대적으로 설정이 복잡하고, 키 관리(rotation)가 번거로움
+- CPU 오버헤드가 WireGuard보다 다소 높은 편
+
+## Cilium Transparent Encryption - WireGuard
+
+- 같은 목적(Pod 간 트래픽 자동 암호화)이지만, 더 최신 기술인 WireGuard를 사용하는 방식
+
+### WireGuard란?
+
+- 최근 개발된 VPN 프로토콜, Linux 커널에 정식으로 통합됨
+- 코드베이스가 매우 작고 단순함 (IPsec 대비 훨씬 적은 코드) → 보안 감사가 쉽고 버그 적음
+- 최신 암호화 알고리즘(ChaCha20, Poly1305 등) 사용
+
+### 설정 예시
+
+```bash
+helm upgrade cilium cilium/cilium \
+  --namespace kube-system \
+  --set encryption.enabled=true \
+  --set encryption.type=wireguard
+```
+
+### IPsec vs WireGuard 비교
+
+| 항목        | IPsec               | WireGuard              |
+| ----------- | ------------------- | ---------------------- |
+| 역사        | 오래됨, 검증됨      | 비교적 최신            |
+| 설정 복잡도 | 높음                | 낮음 (설정 간단)       |
+| 성능        | 상대적으로 낮음     | 더 빠름, 오버헤드 적음 |
+| 코드 복잡도 | 복잡 (공격 표면 큼) | 단순 (공격 표면 작음)  |
+| Cilium 권장 | -                   | 최근 기본 권장 방식    |
+
+### 공통점 (둘 다)
+
+- 애플리케이션 코드 수정 불필요
+- Pod YAML 수정 불필요 (Cilium 설정만으로 클러스터 전체 적용)
+- "Transparent(투명)"라는 이름처럼, 사용자는 암호화가 일어나는지 신경 쓸 필요 없음
+
+## Security Context - readOnlyRootFilesystem
+
+```yaml
+securityContext:
+  readOnlyRootFilesystem: true
+```
+
+### 무엇을 하는가
+
+컨테이너의 루트 파일시스템(`/`)을 쓰기 금지 상태로 만들어요. 컨테이너 안에서 `touch /malicious.sh`, `echo x > /etc/passwd` 같은 시도가 전부 실패해요.
+
+### 왜 중요한가 (공격 시나리오)
+
+- 공격자가 애플리케이션 취약점(예: RCE)을 이용해 컨테이너에 침투했다고 가정
+  - 루트 파일시스템이 쓰기 가능 → 악성 스크립트를 파일로 저장, 실행 파일 변조, 크론잡 등록 등 가능
+  - 루트 파일시스템이 읽기 전용 → 이런 "파일을 심는" 공격 자체가 원천 차단됨
+
+### 실전 문제 — 앱이 쓰기가 필요한 경우
+
+- 많은 애플리케이션이 임시 파일(캐시, 로그, PID 파일 등)을 위해 쓰기 공간이 필요함
+- 이럴 땐 특정 디렉토리만 별도 볼륨으로 할당
+  ```yaml
+  apiVersion: v1
+  kind: Pod
+  spec:
+    containers:
+      - name: app
+        image: myapp
+        securityContext:
+          readOnlyRootFilesystem: true
+        volumeMounts:
+          - name: tmp-vol
+            mountPath: /tmp
+          - name: cache-vol
+            mountPath: /app/cache
+    volumes:
+      - name: tmp-vol
+        emptyDir: {}
+      - name: cache-vol
+        emptyDir: {}
+  ```
+
+### 확인 방법
+
+```bash
+kubectl exec -it <pod> -- touch /test
+# 결과: touch: /test: Read-only file system   ← 정상 동작 확인
+```
+
+## Monolithic vs Microservices
+
+### Monolithic (모놀리식) 아키텍처
+
+- 하나의 거대한 애플리케이션 안에 모든 기능(로그인, 결제, 주문, 배송 등)이 다 들어있는 구조
+  ```scss
+  [ 하나의 큰 애플리케이션 ]
+    ├─ 로그인 기능
+    ├─ 결제 기능
+    ├─ 주문 기능
+    └─ 배송 기능
+  (전부 한 프로세스, 한 배포 단위)
+  ```
+
+  - 장점: 개발 초기 단순함, 배포가 간단(하나만 배포)
+  - 단점: 하나만 고쳐도 전체를 다시 배포해야 함, 하나가 죽으면 전체 영향
+
+### Microservices (마이크로서비스) 아키텍처
+
+- 기능별로 독립된 작은 서비스로 쪼개서, 각자 독립적으로 배포/확장 가능하게 만든 구조
+
+  ```scss
+  [로그인 서비스] [결제 서비스] [주문 서비스] [배송 서비스]
+     (각자 독립된 Pod/Deployment, 서로 네트워크로 통신)
+  ```
+
+  - 장점: 서비스별 독립 배포/확장, 장애 격리(하나 죽어도 나머지는 살아있음)
+  - 단점: 서비스 간 통신이 복잡해짐, 네트워크 장애/보안 문제가 새로운 골칫거리로 등장
+
+### Kubernetes와의 관계
+
+- Kubernetes 자체가 마이크로서비스 아키텍처를 운영하기 위해 만들어진 플랫폼임
+- 앞서 다룬 Pod, Service, NetworkPolicy 등이 전부 "여러 개의 독립된 서비스를 어떻게 관리/연결/보호할지"에 대한 도구들
+
+## Challenges with MicroserviceArchitecture
+
+- 원래 하나였던 애플리케이션을 여러 개의 독립된 서비스로 나누는 순간, 예전에는 없었던 종류의 문제들이 새로 생겨나고, 이게 바로 Service Mesh가 등장한 이유임
+
+| 문제                  | 설명                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------ |
+| 서비스 간 통신 급증   | 서비스가 10개, 100개가 되면 서로 호출하는 경로(N x N)가 기하급수적으로 늘어남                    |
+| 보안 (암호화)         | 서비스마다 개별적으로 TLS를 구현해야 함 → 중복 작업, 실수 위험                                   |
+| 인증/인가             | "이 서비스가 저 서비스를 호출할 권한이 있는가"를 매번 개발자가 코드로 구현해야 함                |
+| 관찰성(Observability) | 요청이 여러 서비스를 거치면서 어디서 느려지는지, 어디서 실패하는지 추적하기 어려움               |
+| 재시도/장애 대응      | 특정 서비스가 느려지거나 죽었을 때 재시도, 타임아웃, 서킷브레이커 등을 각 서비스마다 구현해야 함 |
+| 트래픽 제어           | 카나리 배포, A/B 테스트를 위한 세밀한 트래픽 분배가 어려움                                       |
+
+### 전통적 해결법의 한계
+
+- 각 서비스 코드 안에 TLS 라이브러리, 재시도 로직, 인증 로직을 전부 심는 방식 → 언어마다 다르게 구현해야 하고, 라이브러리 업데이트마다 모든 서비스를 재배포해야 함 → 유지보수 지옥
+- 이 문제를 해결하기 위해 나온 게 Service Mesh임
+
+## Servcie Mesh
+
+- 애플리케이션 코드를 건드리지 않고, 서비스 간 통신(네트워크 레벨)에서 보안/관찰성/트래픽제어를 처리해주는 인프라 레이어
+
+### 핵심 아이디어 — Sidecar Proxy 패턴
+
+```scss
+[ Pod ]
+  ├─ [ 애플리케이션 컨테이너 ]  ← 비즈니스 로직만 신경 씀
+  └─ [ Sidecar Proxy 컨테이너 ]  ← 모든 네트워크 트래픽을 가로채서 처리
+```
+
+- 애플리케이션 컨테이너가 다른 서비스와 통신할 때, 실제로는 트래픽이 같은 Pod 안의 "사이드카 프록시"를 거쳐감
+- 프록시가 아래의 역할을 애플리케이션 코드 수정 없이 대신 처리
+  - 자동으로 TLS 암호화 적용 (mTLS)
+  - 요청 재시도, 타임아웃 처리
+  - 요청/응답 메트릭 수집 (관찰성)
+  - 트래픽 분배 (카나리 배포 등)
+
+### 정리
+
+- Service Mesh = "서비스들 사이의 통신을 관리하는 전용 인프라 계층"
+- 대표 구현체: Istio, Linkerd, Cilium Service Mesh
+
+## Introduction to Istio
+
+- 가장 널리 쓰이는 Service Mesh 구현체
+
+### 구성 요소
+
+```scss
+Istio
+  ├─ Data Plane (데이터 평면)
+  │     = 각 Pod에 주입되는 Envoy 사이드카 프록시들
+  │       (실제 트래픽이 지나가는 부분)
+  │
+  └─ Control Plane (제어 평면)
+        = istiod (모든 사이드카에게 설정/정책을 배포하는 중앙 관리자)
+```
+
+- Envoy Proxy: Istio가 사용하는 사이드카 프록시 구현체 (고성능 L7 프록시)
+- istiod: 전체 메시의 설정을 관리하는 컨트롤러
+
+### 설치 확인
+
+```bash
+kubectl get pods -n istio-system
+istioctl version
+```
+
+### 주요 기능
+
+- 자동 mTLS (서비스 간 통신 자동 암호화)
+- 세밀한 트래픽 라우팅 (카나리, 블루/그린 배포)
+- 서킷 브레이커, 재시도, 타임아웃
+- 관찰성 (Kiali, Jaeger 연동으로 요청 흐름 시각화)
+
+## Istio - Automatic Sidecar Proxy Injection
+
+- Istio가 사용자 대신 자동으로 Envoy 사이드카를 Pod에 주입해주는 기능
+- 앞서 다룬 MutatingAdmissionWebhook이 실제로 여기서 쓰임
+
+### 동작 원리
+
+```scss
+Pod 생성 요청
+    │
+    ▼
+MutatingAdmissionWebhook (istiod가 등록해둔 웹훅)
+    │
+    ▼
+Pod spec에 Envoy 컨테이너를 자동으로 추가 (mutate)
+    │
+    ▼
+사용자는 애플리케이션 컨테이너 하나만 정의했는데,
+실제로는 2개 컨테이너(앱 + Envoy)를 가진 Pod가 생성됨
+```
+
+### 활성화 방법 — 네임스페이스 라벨
+
+```bash
+kubectl label namespace default istio-injection=enabled
+```
+
+- 이 라벨이 붙은 네임스페이스에서 Pod가 생성되면, Istio의 MutatingWebhook이 자동으로 Envoy 사이드카를 끼워 넣음
+
+### 확인해보기
+
+```bash
+# 출력 예: app istio-proxy   ← 2개 컨테이너가 보임 (직접 정의 안 했는데 istio-proxy가 자동 추가됨)
+kubectl get pod <pod-name> -o jsonpath='{.spec.containers[*].name}'
+```
+
+### 앞서 배운 개념과의 연결
+
+- Admission Controller 설명 때 언급했던 "Istio의 사이드카 자동 주입이 MutatingWebhook으로 구현된다"는 실제 사례
+
+## Overview of Mutual TLS with Istio
+
+- Istio가 서비스 간 통신에 mTLS를 자동으로 적용하는 원리
+- 앞서 etcd에서 다뤘던 mTLS 개념이 이제 Pod 간 통신에도 그대로 적용됨
+
+### 동작 원리
+
+```scss
+Service A (Pod)              Service B (Pod)
+  ├─ App 컨테이너               ├─ App 컨테이너
+  └─ Envoy 사이드카  ←—mTLS—→   └─ Envoy 사이드카
+      (인증서 자동 발급/교체)         (인증서 자동 발급/교체)
+```
+
+- 애플리케이션 코드는 평문 HTTP로 통신하는 것처럼 작성됨 (간단함 유지)
+- 실제로는 각 Pod의 Envoy 사이드카가 트래픽을 가로채서, Envoy끼리 mTLS로 암호화해서 통신
+- 인증서는 istiod가 각 Pod의 ServiceAccount ID를 기반으로 자동 발급, 자동 갱신 (사람이 관리 안 해도 됨)
+
+### PeerAuthentication으로 mTLS 모드 설정
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+```
+
+### mTLS 모드 종류
+
+| 모드       | 설명                                              |
+| ---------- | ------------------------------------------------- |
+| STRICT     | mTLS만 허용, 평문 트래픽은 거부                   |
+| PERMISSIVE | mTLS와 평문 둘 다 허용 (마이그레이션 중 과도기용) |
+| DISABLE    | mTLS 비활성화                                     |
+
+### 왜 강력한가
+
+- 앞서 다룬 "etcd의 mTLS"는 특정 컴포넌트 몇 개 사이의 통신만 보호했다면, Istio mTLS는 클러스터 내 모든 마이크로서비스 간 통신을 자동으로 보호
+- 인증서 발급/갱신을 사람이 수동으로 안 해도 됨 (앞서 배운 "레거시 방식이 왜 위험한가"의 정반대 - 완전 자동화된 짧은 유효기간 인증서)
+
+## Practical - Mutual TLS with Istio
+
+- 실제로 mTLS를 적용하고 검증하는 실습 흐름
+
+### 1단계 - Istio 설치 및 네임스페이스 활성화
+
+```bash
+kubectl label namespace default istio-injection=enabled
+```
+
+### 2단계 - 애플리케이션 배포 (사이드카 자동 주입됨)
+
+```bash
+kubectl apply -f my-app-deployment.yaml
+kubectl get pods
+# NAME              READY   STATUS
+# my-app-xxxx       2/2     Running   ← 2/2면 사이드카가 정상 주입된 것
+```
+
+### 3단계 - PeerAuthentication으로 STRICT mTLS 강제
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+```bash
+kubectl apply -f peer-auth.yaml
+```
+
+### 4단계 - mTLS가 실제로 적용됐는지 검증
+
+```bash
+istioctl authn tls-check <pod-name>.<namespace>
+```
+
+### 5단계 - 암호화되지 않은 요청이 거부되는지 확인
+
+- 사이드카가 없는 Pod에서 사이드카가 있는 Pod로 평문 요청을 시도하면 STRICT 모드에서는 연결 자체가 거부됨
+- 이게 "mTLS가 실제로 강제되고 있다"는 증거임
+
+### CKS 시험 관점
+
+- Istio 자체를 처음부터 설치하는 문제보다는, 이미 설치된 클러스터에서 PeerAuthentication 같은 정책을 작성하거나, mTLS 모드를 확인/수정하는 문제로 나올 가능성이 높음
+
+## 전체 흐름 요약
+
+```scss
+Monolithic → Microservices로 전환
+        │
+        ▼
+서비스 간 통신 문제 발생 (보안, 관찰성, 트래픽 제어)
+        │
+        ▼
+Service Mesh(Istio)가 사이드카 프록시로 이 문제를 해결
+        │
+        ▼
+Sidecar Auto Injection (MutatingWebhook으로 자동 주입)
+        │
+        ▼
+mTLS로 서비스 간 통신 자동 암호화 (PeerAuthentication)
+        │
+        ▼
++ Cilium Transparent Encryption = CNI 레벨에서도 암호화 가능 (Istio와는 다른 계층의 해법)
+```
