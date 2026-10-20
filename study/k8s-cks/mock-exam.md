@@ -1067,3 +1067,519 @@ Error from server (Forbidden): namespaces is forbidden: User "60099@internal.use
 ```
 
 - 실무에서는 CA 개인키를 직접 다루지 않는 API 방식이 더 안전하고 승인 이력도 남아 권장됨
+
+## Cluster Hardening - Exercise caution in using ServiceAccounts
+
+### ServiceAccount Token Mounting
+
+1. 설정 파일 `/opt/ks/pod-one.yaml`을 수정하여 해당 Pod에 ServiceAccount 토큰이 마운트되지 않도록 비활성화하세요.
+2. 수정한 파일 `/opt/ks/pod-one.yaml`을 `one` 네임스페이스에 적용하세요.
+3. ServiceAccount 토큰이 Pod에 마운트되지 않았는지 검증하세요.
+
+```yaml
+# /opt/ks/pod-one.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-one
+  namespace: one
+spec:
+  serviceAccountName: custom
+  automountServiceAccountToken: false # Add
+  containers:
+    - name: webserver
+      image: nginx:1.19.6-alpine
+      ports:
+        - containerPort: 80
+```
+
+```bash
+$ k apply -f /opt/ks/pod-one.yaml -n one
+pod/pod-one created
+
+$ k get pods -n one
+NAME      READY   STATUS    RESTARTS   AGE
+pod-one   1/1     Running   0          6s
+
+# pod 내부에서 확인
+$ k exec -it -n one pod-one -- sh
+/ # mount | grep -i serviceaccount
+```
+
+1. `two` 네임스페이스의 `default` ServiceAccount를 수정하여, 이를 사용하는 모든 Pod가 기본적으로 해당 토큰을 마운트하지 않도록 하세요.
+2. Pod 설정 파일 `/opt/ks/pod-two.yaml`을 `two` 네임스페이스에 적용하세요.
+3. ServiceAccount 토큰이 Pod에 마운트되지 않았는지 검증하세요.
+
+```bash
+$ k get sa -n two
+NAME      AGE
+default   8m32s
+
+$ k edit sa -n two
+```
+
+```yaml
+# Please edit the object below. Lines beginning with a '#' will be ignored,
+# and an empty file will abort the edit. If an error occurs while saving this file will be
+# reopened with the relevant failures.
+#
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  creationTimestamp: "2026-10-05T07:57:56Z"
+  name: default
+  namespace: two
+  resourceVersion: "5715"
+  uid: b5d1abc3-caec-4619-906f-ff5a19414d4b
+automountServiceAccountToken: false
+```
+
+```bash
+$ k get sa -n two -o yaml
+apiVersion: v1
+items:
+- apiVersion: v1
+  automountServiceAccountToken: false
+  kind: ServiceAccount
+  metadata:
+    creationTimestamp: "2026-10-05T07:57:56Z"
+    name: default
+    namespace: two
+...
+$ cat /opt/ks/pod-two.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-two
+  namespace: two
+spec:
+  containers:
+  - name: webserver
+    image: nginx:1.19.6-alpine
+    ports:
+    - containerPort: 80
+
+$ k apply -f /opt/ks/pod-two.yaml
+pod/pod-two created
+
+$ k exec -it -n two pod-two -- sh
+/ # mount | grep -i serviceaccount
+```
+
+## Cluster Hardening - Restrict API Access
+
+### apiserver Crash
+
+여기서의 아이디어는 Apiserver를 여러 가지 방식으로 잘못 설정한 다음, 오류가 기록될 수 있는 로그 위치들을 확인해보는 것임.
+Apiserver가 다시 올라오지 않는 상황에 매우 익숙해져야 함.
+Apiserver 매니페스트에 `--this-is-very-wrong`이라는 새 인자를 추가하여 설정함.
+Pod가 다시 올라오는지, 그리고 이로 인해 어떤 로그가 남는지 확인함.
+Apiserver를 다시 정상으로 복구함.
+
+```bash
+# 원본 파일 백업
+$ cp /etc/kubernetes/manifests/kube-apiserver.yaml ~
+
+$ grep -i -B2 wrong kube-apiserver.yaml
+  - command:
+    - kube-apiserver
+    - --this-is-very-wrong
+
+$ cat /var/log/pods/kube-system_kube-apiserver-controlplane_c130c47187dfe5e4eeeeff210327ba6e/kube-apiserver/4.log
+2026-10-10T05:52:32.583924844Z stderr F Error: unknown flag: --this-is-very-wrong
+
+$ k get pods -n kube-system
+E1010 05:54:30.830479    6225 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://172.30.1.2:6443/api?timeout=32s\": dial tcp 172.30.1.2:6443: connect: connection refused"
+
+# 원복 파일로 복구
+$ cp ~/kube-apiserver.yaml /etc/kubernetes/manifests/
+
+$ kubectl get pods -n kube-system
+```
+
+기존 Apiserver 매니페스트의 인자를 `--etcd-servers=this-is-very-wrong`으로 변경함.
+`/var` 아래의 어떤 것도 사용하지 않고 로그가 무엇이라고 말하는지 확인함.
+Apiserver를 다시 정상으로 복구함.
+
+```bash
+
+# 확인 및 복구
+$ cat /var/log/pods/kube-system_kube-apiserver-controlplane_2ebad3b5d3275ca963796567310f02a3/kube-apiserver/4.log | grep -i wrong
+2026-10-10T06:04:14.693519979Z stderr F W1010 06:04:14.693481       1 logging.go:55] [core] [Channel #1 SubChannel #3]grpc: addrConn.createTransport failed to connect to {Addr: "this-is-very-wrong", ServerName: "this-is-very-wrong", BalancerAttributes: {"<%!p(pickfirstleaf.managedByPickfirstKeyType={})>": "<%!p(bool=true)>" }}. Err: connection error: desc = "transport: Error while dialing: dial tcp: address this-is-very-wrong: missing port in address"
+
+# 이전 pod 로그가 아직 살아있음
+# kube-system_kube-apiserver-controlplane_[POD UID]/
+$ ls /var/log/pods/kube-system_kube-apiserver-controlplane_
+kube-system_kube-apiserver-controlplane_1353433a429ac874f96c45a61f16da4e/
+kube-system_kube-apiserver-controlplane_2ebad3b5d3275ca963796567310f02a3/
+
+# pod UID 확인하는 방법
+# pod PID
+$ crictl pods --name kube-apiserver
+POD ID              CREATED             STATE               NAME                          NAMESPACE           ATTEMPT             RUNTIME
+b43ef9c28fc4a       12 minutes ago      Ready               kube-apiserver-controlplane   kube-system         0                   (default)
+
+$ crictl inspectp b43ef9c28fc4a | grep -w "uid"
+"uid": "2ebad3b5d3275ca963796567310f02a3"
+
+$ ls -l /var/log/pods/ | grep -i 2ebad3b5d3275ca963796567310f02a3
+drwxr-xr-x 3 root root 4096 Oct 10 06:09 kube-system_kube-apiserver-controlplane_2ebad3b5d3275ca963796567310f02a3
+
+$ cat /var/log/pods/kube-system_kube-apiserver-controlplane_2ebad3b5d3275ca963796567310f02a3/kube-apiserver/7.log | grep -i wrong
+2026-10-10T06:22:50.956337584Z stderr F W1010 06:22:50.956103       1 logging.go:55] [core] [Channel #1 SubChannel #4]grpc: addrConn.createTransport failed to connect to {Addr: "this-is-very-wrong", ServerName: "this-is-very-wrong", BalancerAttributes: {"<%!p(pickfirstleaf.managedByPickfirstKeyType={})>": "<%!p(bool=true)>" }}. Err: connection error: desc = "transport: Error while dialing: dial tcp: address this-is-very-wrong: missing port in address"
+```
+
+## Apiserver Misconfigured
+
+kube-apiserver가 실행되고 있지 않음. `/etc/kubernetes/manifests/kube-apiserver.yaml`의 static Pod 매니페스트가 3곳에서 잘못 설정되어 있음.
+3개의 오류를 모두 찾아서 수정하여 kube-apiserver가 정상적으로 시작되도록 함.
+유용한 로그 위치:
+
+- `/var/log/pods`
+- `/var/log/containers`
+- `crictl ps` 및 `crictl logs`
+- `journalctl -u kubelet`
+
+```bash
+# 1. 컨테이너가 생성되었는지 확인
+$ crictl ps -a | grep kube-apiserver # 컨테이너 없음
+
+$ pwd
+/var/log/pods/kube-system_kube-apiserver-controlplane_1353433a429ac874f96c45a61f16da4e/kube-apiserver
+
+$ ls # 로그 없음
+
+# 2. 컨테이너가 아예 없으면 (YAML 문법 오류 등)
+journalctl -u kubelet --no-pager | grep -i apiserver | tail -n 20
+
+# 2-A. 컨테이너가 있으면 로그 확인 (Exited 포함)
+crictl logs <컨테이너ID> 2>&1 | tail -n 20
+
+```
+
+- kubelet 로그 확인
+
+```bash
+$ journalctl -u kubelet.service --no-pager | grep -i kube-api | tail -n 20
+# api-server가 죽어서 생긴 로그로 원인이 되지 않음
+Oct 10 07:08:39 controlplane kubelet[2012]: E1010 07:08:39.903774    2012 mirror_client.go:139] "Failed deleting a mirror pod" err="Delete \"https://172.30.1.2:6443/api/v1/namespaces/kube-system/pods/kube-apiserver-controlplane\": dial tcp 172.30.1.2:6443: connect: connection refused" pod="kube-system/kube-apiserver-controlplane"
+...
+
+# api-server.yaml 4번째 줄에 오타 수정
+Oct 10 07:08:49 controlplane kubelet[2012]: E1010 07:08:49.796918    2012 file.go:187] "Could not process manifest file" err="/etc/kubernetes/manifests/kube-apiserver.yaml: couldn't parse as pod(yaml: line 4: could not find expected ':'), please check config file" path="/etc/kubernetes/manifests/kube-apiserver.yaml"
+
+$ journalctl -u kubelet.service --no-pager | grep -i kube-api | tail -n 20
+
+# I1010 : Info 수준의 로그
+Oct 10 07:12:46 controlplane kubelet[6492]: I1010 07:12:46.777316    6492 reconciler_common.go:251] "operationExecutor.VerifyControllerAttachedVolume started for volume \"etc-ca-certificates\" (UniqueName: \"kubernetes.io/host-path/d14f29a1aabee5555f4951a0fb77a3ca-etc-ca-certificates\") pod \"kube-apiserver-controlplane\" (UID: \"d14f29a1aabee5555f4951a0fb77a3ca\") " pod="kube-system/kube-apiserver-controlplane"
+
+# E1010 : Error 수준의 로그
+Oct 10 07:18:05 controlplane kubelet[6492]: E1010 07:18:05.078471    6492 pod_workers.go:1324] "Error syncing pod, skipping" err="failed to \"StartContainer\" for \"kube-apiserver\" with CrashLoopBackOff: \"back-off 5m0s restarting failed container=kube-apiserver pod=kube-apiserver-controlplane_kube-system(d14f29a1aabee5555f4951a0fb77a3ca)\"" pod="kube-system/kube-apiserver-controlplane" podUID="d14f29a1aabee5555f4951a0fb77a3ca
+
+# pod 생성 확인
+$ crictl ps -a | grep -i kube-apiserver
+4090412d5dbfe       6f9eeb0cff981       15 seconds ago      Exited              kube-apiserver            8                   8113be9c3a708       kube-apiserver-controlplane               kube-system
+
+# 파드 로그 확인
+$ cat /var/log/pods/kube-system_kube-apiserver-controlplane_d14f29a1aabee5555f4951a0fb77a3ca/kube-apiserver/8.log
+2026-10-10T07:23:10.498266635Z stderr F Error: unknown flag: --authorization-mode-wrong
+
+$ grep -i 'authorization-mode' /etc/kubernetes/manifests/kube-apiserver.yaml
+    - --authorization-mode=Node,RBAC
+
+# 최신의 파드 로그 확인
+$ ls -ltd /var/log/pods/kube-system_kube-apiserver-controlplane_*
+drwxr-xr-x 3 root root 4096 Oct 10 07:27 /var/log/pods/kube-system_kube-apiserver-controlplane_31b5450c49a061d4686f95e92e0aa2b6
+drwxr-xr-x 3 root root 4096 Oct 10 07:12 /var/log/pods/kube-system_kube-apiserver-controlplane_d14f29a1aabee5555f4951a0fb77a3ca
+
+cat /var/log/pods/kube-system_kube-apiserver-controlplane_31b5450c49a061d4686f95e92e0aa2b6/kube-apiserver/3.log
+2026-10-10T07:28:28.172805502Z stderr F I1010 07:28:28.172679       1 options.go:263] external host was not specified, using 172.30.1.2
+2026-10-10T07:28:28.17447968Z stderr F I1010 07:28:28.174412       1 server.go:150] Version: v1.35.1
+2026-10-10T07:28:28.174536467Z stderr F I1010 07:28:28.174523       1 server.go:152] "Golang settings" GOGC="" GOMAXPROCS="" GOTRACEBACK=""
+2026-10-10T07:28:28.174843063Z stderr F E1010 07:28:28.174816       1 run.go:72] "command failed" err="open /etc/kubernetes/pki/apiserver-wrong.crt: no such file or directory"
+
+# 인증서 확인
+ls /etc/kubernetes/pki/apiserver*
+/etc/kubernetes/pki/apiserver-etcd-client.crt
+/etc/kubernetes/pki/apiserver-etcd-client.key
+/etc/kubernetes/pki/apiserver-kubelet-client.crt
+/etc/kubernetes/pki/apiserver-kubelet-client.key
+/etc/kubernetes/pki/apiserver.crt
+/etc/kubernetes/pki/apiserver.key
+
+# 수정
+$ grep -i 'tls-cert-file' /etc/kubernetes/manifests/kube-apiserver.yaml
+
+    - --tls-cert-file=/etc/kubernetes/pki/apiserver.crt
+
+# kube-apiserver 실행 확인
+$ crictl ps | grep -i api
+8b1c6b4d7babc       6f9eeb0cff981       4 minutes ago       Running             kube-apiserver            0                   78a1c6f48155c       kube-apiserver-controlplane
+```
+
+## Apiserver NodeRestriction
+
+`node01`의 Kubelet은 `node-restriction.kubernetes.io/*`로 시작하는 Node 레이블을 설정할 수 없어야 함.
+현재는 이것이 제한되어 있지 않음을 확인하기 위해, `node01` Node에서 `node01` Node로 `node-restriction.kubernetes.io/one=123` 레이블을 추가해봄.
+
+```bash
+$ ssh node01
+# node01 kubelet의 클라이언트 인증서가 들어있음(system:node:node01 신분)
+$ export KUBECONFIG=/etc/kubernetes/kubelet.conf
+$ k label node node01 node-restriction.kubernetes.io/one=123
+node/node01 labeled
+```
+
+> node-restriction.kubernetes.io/\*
+> = 스케줄링 격리를 위해 관리자만 설정할 수 있게 예약된 접두사
+> = kubelet(침해 가능성이 있는 주체)이 스스로 "나는 신뢰할 만한 노드"라고 주장하지 못하게 막는 장치
+
+NodeRestriction Admission Controller를 활성화하고 문제가 사라졌는지 확인함.
+`node01` Node에서 `node01` Node로 `node-restriction.kubernetes.io/two=123` 레이블을 추가해봄.
+
+```bash
+# controlplane으로 돌아가기
+$ exit
+
+$ grep -i noderestriction /etc/kubernetes/manifests/kube-apiserver.yaml
+    - --enable-admission-plugins=NodeRestriction
+
+# kube-apiserver 재시작되었는지 확인
+$ crictl ps
+CONTAINER           IMAGE               CREATED             STATE               NAME                      ATTEMPT             POD ID              POD                                       NAMESPACE
+08ccd4fb3c81e       6f9eeb0cff981       11 seconds ago      Running             kube-apiserver            0                   c08676cb6bc0d       kube-apiserver-controlplane               kube-system
+
+$ ssh node01
+$ export KUBECONFIG=/etc/kubernetes/kubelet.conf
+
+# node-restriction.kubernetes.io/* 은 관리자 전용 접두사
+$ kubectl label node node01 node-restriction.kubernetes.io/two=123
+Error from server (Forbidden): nodes "node01" is forbidden: is not allowed to modify labels: node-restriction.kubernetes.io/two
+
+# 일반 레이블이지만 다른 노드에 설정 불가능
+$ k label node controlplane killercoda/two=123 # restricted by default on different node
+
+# 일반 레이블이고 자기 노드이므로 설정 가능
+$ k label node node01 test/two=123 # works because not restricted
+node/node01 labeled
+```
+
+# Cluster Hardening - Exercise caution in using ServiceAccounts
+
+## ServiceAccount Token Mounting
+
+1. 설정 파일 `/opt/ks/pod-one.yaml`을 수정하여 해당 Pod에 ServiceAccount 토큰이 마운트되지 않도록 비활성화하세요.
+2. 수정한 파일 `/opt/ks/pod-one.yaml`을 `one` 네임스페이스에 적용하세요.
+3. ServiceAccount 토큰이 Pod에 마운트되지 않았는지 검증하세요.
+
+```yaml
+# /opt/ks/pod-one.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-one
+  namespace: one
+spec:
+  serviceAccountName: custom
+  automountServiceAccountToken: false # Add
+  containers:
+    - name: webserver
+      image: nginx:1.19.6-alpine
+      ports:
+        - containerPort: 80
+```
+
+```bash
+$ k apply -f /opt/ks/pod-one.yaml -n one
+pod/pod-one created
+
+$ k get pods -n one
+NAME      READY   STATUS    RESTARTS   AGE
+pod-one   1/1     Running   0          6s
+
+# pod 내부에서 확인
+$ k exec -it -n one pod-one -- sh
+/ # mount | grep -i serviceaccount
+```
+
+1. `two` 네임스페이스의 `default` ServiceAccount를 수정하여, 이를 사용하는 모든 Pod가 기본적으로 해당 토큰을 마운트하지 않도록 하세요.
+2. Pod 설정 파일 `/opt/ks/pod-two.yaml`을 `two` 네임스페이스에 적용하세요.
+3. ServiceAccount 토큰이 Pod에 마운트되지 않았는지 검증하세요.
+
+```bash
+$ k get sa -n two
+NAME      AGE
+default   8m32s
+
+$ k edit sa -n two
+```
+
+```yaml
+# Please edit the object below. Lines beginning with a '#' will be ignored,
+# and an empty file will abort the edit. If an error occurs while saving this file will be
+# reopened with the relevant failures.
+#
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  creationTimestamp: "2026-10-05T07:57:56Z"
+  name: default
+  namespace: two
+  resourceVersion: "5715"
+  uid: b5d1abc3-caec-4619-906f-ff5a19414d4b
+automountServiceAccountToken: false
+```
+
+```bash
+$ k get sa -n two -o yaml
+apiVersion: v1
+items:
+- apiVersion: v1
+  automountServiceAccountToken: false
+  kind: ServiceAccount
+  metadata:
+    creationTimestamp: "2026-10-05T07:57:56Z"
+    name: default
+    namespace: two
+...
+$ cat /opt/ks/pod-two.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-two
+  namespace: two
+spec:
+  containers:
+  - name: webserver
+    image: nginx:1.19.6-alpine
+    ports:
+    - containerPort: 80
+
+$ k apply -f /opt/ks/pod-two.yaml
+pod/pod-two created
+
+$ k exec -it -n two pod-two -- sh
+/ # mount | grep -i serviceaccount
+```
+
+# Cluster Hardening - Restrict API Access
+
+## apiserver-Crash
+
+여기서의 아이디어는 Apiserver를 여러 가지 방식으로 잘못 설정한 다음, 오류가 기록될 수 있는 로그 위치들을 확인해보는 것임
+Apiserver가 다시 올라오지 않는 상황에 매우 익숙해져야 함
+Apiserver 매니페스트에 `--this-is-very-wrong`이라는 새 인자를 추가하여 설정함
+Pod가 다시 올라오는지, 그리고 이로 인해 어떤 로그가 남는지 확인함
+Apiserver를 다시 정상으로 복구함
+
+```bash
+# 백업
+$ cp /etc/kubernetes/manifest/kube-apiserver.yaml ~
+
+# 설정 변경
+$ grep -C3 'this' /etc/kubernetes/manifests/kube-apiserver.yaml
+  containers:
+  - command:
+    - kube-apiserver
+    - --this-is-very-wrong # 추가
+    - --advertise-address=172.30.1.2
+    - --allow-privileged=true
+    - --authorization-mode=Node,RBAC
+
+$ ps -ef | grep kube-api
+root        2241    2049  1 09:50 ?        00:02:38 kube-apiserver --advertise-address=172.30.1.2 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-admission-plugins=NodeRestriction --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/12 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
+
+$ kill -9 2241
+
+$ tail -f /var/log/pods/kube-system_kube-apiserver-controlplane_c130c47187dfe5e4eeeeff210327ba6e/kube-apiserver/3.log
+2026-10-20T12:05:19.856403626Z stderr F Error: unknown flag: --this-is-very-wrong
+
+# 원복
+$ cp ~/kube-apiserver.yaml /etc/kubernetes/manifest/
+```
+
+## apiserver-Misconfigured
+
+기존 Apiserver 매니페스트의 인자를 `--etcd-servers=this-is-very-wrong`으로 변경함.
+`/var` 아래의 어떤 것도 사용하지 않고 로그가 무엇이라고 말하는지 확인함.
+Apiserver를 다시 정상으로 복구함
+
+```bash
+$ grep -C2 'this' /etc/kubernetes/manifests/kube-apiserver.yaml
+    - --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt
+    - --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key
+    - --etcd-servers=this-is-very-wrong
+    - --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt
+    - --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key
+
+$ tail -n 3 /var/log/pods/kube-system_kube-apiserver-controlplane_2ebad3b5d3275ca963796567310f02a3/kube-apiserver/2.log
+2026-10-20T12:17:03.568099889Z stderr F W1020 12:17:03.568000       1 logging.go:55] [core] [Channel #2 SubChannel #7]grpc: addrConn.createTransport failed to connect to {Addr: "this-is-very-wrong", ServerName: "this-is-very-wrong", BalancerAttributes: {"<%!p(pickfirstleaf.managedByPickfirstKeyType={})>": "<%!p(bool=true)>" }}. Err: connection error: desc = "transport: Error while dialing: dial tcp: address this-is-very-wrong: missing port in address"
+2026-10-20T12:17:04.016946982Z stderr F W1020 12:17:04.016804       1 logging.go:55] [core] [Channel #1 SubChannel #5]grpc: addrConn.createTransport failed to connect to {Addr: "this-is-very-wrong", ServerName: "this-is-very-wrong", BalancerAttributes: {"<%!p(pickfirstleaf.managedByPickfirstKeyType={})>": "<%!p(bool=true)>" }}. Err: connection error: desc = "transport: Error while dialing: dial tcp: address this-is-very-wrong: missing port in address"
+2026-10-20T12:17:08.378232613Z stderr F F1020 12:17:08.378125       1 instance.go:233] Error creating leases: error creating storage factory: context deadline exceeded
+
+$ tail -n 3 /var/log/containers/kube-apiserver-controlplane_kube-system_kube-apiserver-3ed44e90dcf9cbdb4f9e9a5830d829a287a019404261a60aee27d81abc63f600.log
+2026-10-20T12:17:50.965139014Z stderr F W1020 12:17:50.965035       1 logging.go:55] [core] [Channel #1 SubChannel #5]grpc: addrConn.createTransport failed to connect to {Addr: "this-is-very-wrong", ServerName: "this-is-very-wrong", BalancerAttributes: {"<%!p(pickfirstleaf.managedByPickfirstKeyType={})>": "<%!p(bool=true)>" }}. Err: connection error: desc = "transport: Error while dialing: dial tcp: address this-is-very-wrong: missing port in address"
+2026-10-20T12:17:51.714372383Z stderr F W1020 12:17:51.714258       1 logging.go:55] [core] [Channel #3 SubChannel #9]grpc: addrConn.createTransport failed to connect to {Addr: "this-is-very-wrong", ServerName: "this-is-very-wrong", BalancerAttributes: {"<%!p(pickfirstleaf.managedByPickfirstKeyType={})>": "<%!p(bool=true)>" }}. Err: connection error: desc = "transport: Error while dialing: dial tcp: address this-is-very-wrong: missing port in address"
+2026-10-20T12:17:55.139406525Z stderr F F1020 12:17:55.139093       1 instance.go:233] Error creating leases: error creating storage factory: context deadline exceeded
+
+# log를 보기 위해 container id 확인
+$ crictl ps -a --name kube-apiserver
+CONTAINER           IMAGE               CREATED             STATE               NAME                ATTEMPT             POD ID              POD                           NAMESPACE
+f3a93b7346eb8       6f9eeb0cff981       4 minutes ago       Exited              kube-apiserver      8                   831e32937b0f6       kube-apiserver-controlplane   kube-system
+
+$ crictl logs --tail 10 f3a93b7346eb8
+E1020 12:40:37.060344   10541 remote_runtime.go:657] "ContainerStatus from runtime service failed" err="rpc error: code = NotFound desc = an error occurred when try to find container \"f3a93b7346eb8\": not found" containerID="f3a93b7346eb8"
+ERRO[0000] rpc error: code = NotFound desc = an error occurred when try to find container "f3a93b7346eb8": not found
+```
+
+## apiserver-node-restriction
+
+Apiserver 매니페스트를 수정해서 잘못된 YAML을 추가함.
+
+```yaml
+예시:
+apiVersionTHIS IS VERY ::::: WRONG v1
+kind: Pod
+metadata:
+```
+
+로그가 무엇이라고 말하는지 확인하고 다시 고침.
+Apiserver를 다시 정상으로 복구함.
+
+```bash
+$ grep -A2  'THIS' /etc/kubernetes/manifests/kube-apiserver.yaml
+apiVersionTHIS IS VERY ::::: WRONG
+kind: Pod
+metadata:
+
+$ ps -ef | grep api
+root       10693   10644  2 12:41 ?        00:00:05 kube-apiserver --advertise-address=172.30.1.2 --allow-privileged=true --authorization-mode=Node,RBAC --client-ca-file=/etc/kubernetes/pki/ca.crt --enable-admission-plugins=NodeRestriction --enable-bootstrap-token-auth=true --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt --etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt --etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key --etcd-servers=https://127.0.0.1:2379 --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt --proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key --requestheader-allowed-names=front-proxy-client --requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt --requestheader-extra-headers-prefix=X-Remote-Extra- --requestheader-group-headers=X-Remote-Group --requestheader-username-headers=X-Remote-User --secure-port=6443 --service-account-issuer=https://kubernetes.default.svc.cluster.local --service-account-key-file=/etc/kubernetes/pki/sa.pub --service-account-signing-key-file=/etc/kubernetes/pki/sa.key --service-cluster-ip-range=10.96.0.0/12 --tls-cert-file=/etc/kubernetes/pki/apiserver.crt --tls-private-key-file=/etc/kubernetes/pki/apiserver.key
+
+$ kill -9 10693
+
+# kube-apiserver 가 없음
+$ crictl ps -a --name kube-apiserver
+CONTAINER           IMAGE               CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
+
+# exit된 kube-apiserver가 없다보니 로그도 사라짐
+$ ls /var/log/pods/
+kube-system_cilium-envoy-gvf26_ad55cb46-9f03-4e4c-9d5e-90dd5cfc0cbc/
+kube-system_cilium-hsqz7_7e09878d-9554-46ec-a973-c41c2cc268f3/
+kube-system_cilium-operator-78cc4f8d5c-879hn_965a9977-ca3d-44bc-af83-903a047f28e6/
+kube-system_coredns-5f68d5bd7f-9z7t2_7ff7d31e-b441-4532-8fe1-4e8a22998708/
+kube-system_coredns-5f68d5bd7f-qxc25_66fba616-2fd4-48a0-842b-2d9b522c4a7d/
+kube-system_etcd-controlplane_e9372758075579e63217f5b050ad88f3/
+kube-system_kube-controller-manager-controlplane_9558a8794fd8531b32223b3190c0423c/
+kube-system_kube-scheduler-controlplane_99f727e1f9eff311e4b8b8637ae53fda/
+local-path-storage_local-path-provisioner-644f8b49d7-tqvt5_ab796d36-b41a-40a9-b5f8-681042060ab7/
+
+$ ls /var/log/pods/ | grep api
+
+$ ls /var/log/containers/ | grep -i api
+
+$ tail -f /var/log/syslog | grep -i kube-apiserver
+...
+# kube-apiserver.yaml 매니페스트에서 apiVersion이 잘못되었다는 로그
+2026-10-20T12:50:18.162761+00:00 controlplane kubelet[10609]: E1020 12:50:18.162457   10609 file.go:187] "Could not process manifest file" err="/etc/kubernetes/manifests/kube-apiserver.yaml: couldn't parse as pod(Object 'apiVersion' is missing in '{\"apiVersionTHIS IS VERY ::::\":\"WRONG\",\"kind\":\"Pod\",\"metadata\":{\"annotations\":{\"kubeadm.kubernetes.io/kube-apiserver.advertise-address.endpoint\":\"172.30.1.2:6443\"},\"labels\":{\"component\":\"kube-apiserver\",\"tier\":\"control-plane\"},\"name\":\"kube-apiserver\",\"namespace\":\"kube-system\"},\"spec\":{\"containers\":[{\"command\":[\"kube-apiserver\",\"--advertise-address=172.30.1.2\",\"--allow-privileged=true\",\"--authorization-mode=Node,RBAC\",\"--client-ca-file=/etc/kubernetes/pki/ca.crt\",\"--enable-admission-plugins=NodeRestriction\",\"--enable-bootstrap-token-auth=true\",\"--etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt\",\"--etcd-certfile=/etc/kubernetes/pki/apiserver-etcd-client.crt\",\"--etcd-keyfile=/etc/kubernetes/pki/apiserver-etcd-client.key\",\"--etcd-servers=https://127.0.0.1:2379\",\"--kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt\",\"--kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key\",\"--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname\",\"--proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt\",\"--proxy-client-key-file=/etc/kubernetes/pki/front-proxy-client.key\",\"--requestheader-allowed-names=front-proxy-client\",\"--requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt\",\"--requestheader-extra-headers-prefix=X-Remote-Extra-\",\"--requestheader-group-headers=X-Remote-Group\",\"--requestheader-username-headers=X-Remote-User\",\"--secure-port=6443\",\"--service-account-issuer=https://kubernetes.default.svc.cluster.local\",\"--service-account-key-file=/etc/kubernetes/pki/sa.pub\",\"--service-account-signing-key-file=/etc/kubernetes/pki/sa.key\",\"--service-cluster-ip-range=10.96.0.0/12\",\"--tls-cert-file=/etc/kubernetes/pki/apiserver.crt\",\"--tls-private-key-file=/etc/kubernetes/pki/apiserver.key\"],\"image\":\"registry.k8s.io/kube-apiserver:v1.35.1\",\"imagePullPolicy\":\"IfNotPresent\",\"livenessProbe\":{\"failureThreshold\":8,\"httpGet\":{\"host\":\"172.30.1.2\",\"path\":\"/livez\",\"port\":\"probe-port\",\"scheme\":\"HTTPS\"},\"initialDelaySeconds\":10,\"periodSeconds\":10,\"timeoutSeconds\":15},\"name\":\"kube-apiserver\",\"ports\":[{\"containerPort\":6443,\"name\":\"probe-port\",\"protocol\":\"TCP\"}],\"readinessProbe\":{\"failureThreshold\":3,\"httpGet\":{\"host\":\"172.30.1.2\",\"path\":\"/readyz\",\"port\":\"probe-port\",\"scheme\":\"HTTPS\"},\"periodSeconds\":1,\"timeoutSeconds\":15},\"resources\":{\"requests\":{\"cpu\":\"50m\"}},\"startupProbe\":{\"failureThreshold\":24,\"httpGet\":{\"host\":\"172.30.1.2\",\"path\":\"/livez\",\"port\":\"probe-port\",\"scheme\":\"HTTPS\"},\"initialDelaySeconds\":10,\"periodSeconds\":10,\"timeoutSeconds\":15},\"volumeMounts\":[{\"mountPath\":\"/etc/ssl/certs\",\"name\":\"ca-certs\",\"readOnly\":true},{\"mountPath\":\"/etc/ca-certificates\",\"name\":\"etc-ca-certificates\",\"readOnly\":true},{\"mountPath\":\"/etc/kubernetes/pki\",\"name\":\"k8s-certs\",\"readOnly\":true},{\"mountPath\":\"/usr/local/share/ca-certificates\",\"name\":\"usr-local-share-ca-certificates\",\"readOnly\":true},{\"mountPath\":\"/usr/share/ca-certificates\",\"name\":\"usr-share-ca-certificates\",\"readOnly\":true}]}],\"hostNetwork\":true,\"priority\":2000001000,\"priorityClassName\":\"system-node-critical\",\"securityContext\":{\"seccompProfile\":{\"type\":\"RuntimeDefault\"}},\"volumes\":[{\"hostPath\":{\"path\":\"/etc/ssl/certs\",\"type\":\"DirectoryOrCreate\"},\"name\":\"ca-certs\"},{\"hostPath\":{\"path\":\"/etc/ca-certificates\",\"type\":\"DirectoryOrCreate\"},\"name\":\"etc-ca-certificates\"},{\"hostPath\":{\"path\":\"/etc/kubernetes/pki\",\"type\":\"DirectoryOrCreate\"},\"name\":\"k8s-certs\"},{\"hostPath\":{\"path\":\"/usr/local/share/ca-certificates\",\"type\":\"DirectoryOrCreate\"},\"name\":\"usr-local-share-ca-certificates\"},{\"hostPath\":{\"path\":\"/usr/share/ca-certificates\",\"type\":\"DirectoryOrCreate\"},\"name\":\"usr-share-ca-certificates\"}]},\"status\":{}}'), please check config file" path="/etc/kubernetes/manifests/kube-apiserver.yaml"
+...
+```
